@@ -40,7 +40,9 @@ SUPABASE_URL = "https://zqkcoyoknddubrobhfrp.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inpxa2NveW9rbmRkdWJyb2JoZnJwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MzUyMjg1NSwiZXhwIjoyMDc5MDk4ODU1fQ.CM9gmoRO-u2LOnTbZgqAc5lRmwSbWHynyNbk2kUpGIY"
 
 # Rate limiting
-NOTION_RATE_LIMIT_DELAY = 0.33  # 3 requests per second
+NOTION_RATE_LIMIT_DELAY = 0.5  # 2 requests per second (slower to avoid connection resets)
+MAX_RETRIES = 3  # Number of retries for failed requests
+RETRY_DELAY = 2  # Seconds to wait between retries
 
 # ================================================================
 # DATA MODELS
@@ -82,17 +84,33 @@ class NotionClient:
         }
     
     def _make_request(self, method: str, endpoint: str, **kwargs) -> Dict:
-        """Make rate-limited request to Notion API"""
+        """Make rate-limited request to Notion API with retry logic"""
         url = f"{NOTION_BASE_URL}/{endpoint}"
-        
-        try:
-            response = requests.request(method, url, headers=self.headers, **kwargs)
-            response.raise_for_status()
-            sleep(NOTION_RATE_LIMIT_DELAY)  # Rate limiting
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"Error making request to {endpoint}: {e}")
-            return None
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = requests.request(method, url, headers=self.headers, **kwargs)
+                response.raise_for_status()
+                sleep(NOTION_RATE_LIMIT_DELAY)  # Rate limiting
+                return response.json()
+            except requests.exceptions.ConnectionError as e:
+                if attempt < MAX_RETRIES - 1:
+                    print(f"Connection error on attempt {attempt + 1}/{MAX_RETRIES}, retrying in {RETRY_DELAY}s...")
+                    sleep(RETRY_DELAY * (attempt + 1))  # Exponential backoff
+                    continue
+                else:
+                    print(f"Connection error after {MAX_RETRIES} attempts: {e}")
+                    return None
+            except requests.exceptions.RequestException as e:
+                if attempt < MAX_RETRIES - 1:
+                    print(f"Request error on attempt {attempt + 1}/{MAX_RETRIES}, retrying in {RETRY_DELAY}s...")
+                    sleep(RETRY_DELAY * (attempt + 1))
+                    continue
+                else:
+                    print(f"Error making request to {endpoint} after {MAX_RETRIES} attempts: {e}")
+                    return None
+
+        return None
     
     def get_page(self, page_id: str) -> Dict:
         """Fetch a page by ID"""
@@ -297,11 +315,14 @@ class SupabaseManager:
 class PromptExtractor:
     """Extract prompts from different Notion page formats"""
 
-    def __init__(self, notion_client: NotionClient):
+    def __init__(self, notion_client: NotionClient, supabase_manager=None):
         self.notion = notion_client
+        self.supabase = supabase_manager
         self.processed_pages = set()  # Track processed pages to avoid duplicates
+        self.batch_size = 100  # Insert prompts every 100 extractions
+        self.pending_prompts = []  # Prompts waiting to be inserted
     
-    def extract_from_page(self, page_id: str, category: str = None, recursive: bool = False, depth: int = 0) -> List[Prompt]:
+    def extract_from_page(self, page_id: str, category: str = None, recursive: bool = False, depth: int = 0, source_collection: str = None) -> List[Prompt]:
         """Extract prompts from a Notion page"""
         prompts = []
 
@@ -325,14 +346,47 @@ class PromptExtractor:
         prompts.extend(self._extract_javascript_blocks(blocks, page_title, category))
         prompts.extend(self._extract_list_items(blocks, page_title, category))
 
+        # Batch insert if enabled and we have enough prompts
+        if self.supabase and source_collection and prompts:
+            self._batch_insert(prompts, source_collection)
+
         # If recursive, handle child pages and databases (limit depth to avoid infinite loops)
         if recursive and depth < 5:
-            prompts.extend(self._extract_from_child_pages(blocks, page_title, category, depth))
-            prompts.extend(self._extract_from_databases(blocks, page_title, category, depth))
+            prompts.extend(self._extract_from_child_pages(blocks, page_title, category, depth, source_collection))
+            prompts.extend(self._extract_from_databases(blocks, page_title, category, depth, source_collection))
 
         return prompts
 
-    def _extract_from_child_pages(self, blocks: List[Dict], source: str, category: str, depth: int) -> List[Prompt]:
+    def _batch_insert(self, prompts: List[Prompt], source_collection: str):
+        """Insert prompts in batches to save progress"""
+        self.pending_prompts.extend(prompts)
+
+        if len(self.pending_prompts) >= self.batch_size:
+            print(f"    [Batch Insert] Saving {len(self.pending_prompts)} prompts to database...")
+            inserted = 0
+            for prompt in self.pending_prompts:
+                prompt.source = source_collection
+                if self.supabase.insert_prompt(prompt):
+                    inserted += 1
+            print(f"    [Batch Insert] Successfully saved {inserted} prompts")
+            self.pending_prompts.clear()
+
+    def flush_pending_prompts(self, source_collection: str) -> int:
+        """Insert any remaining pending prompts"""
+        if not self.pending_prompts:
+            return 0
+
+        print(f"    [Final Batch] Saving remaining {len(self.pending_prompts)} prompts...")
+        inserted = 0
+        for prompt in self.pending_prompts:
+            prompt.source = source_collection
+            if self.supabase.insert_prompt(prompt):
+                inserted += 1
+        print(f"    [Final Batch] Successfully saved {inserted} prompts")
+        self.pending_prompts.clear()
+        return inserted
+
+    def _extract_from_child_pages(self, blocks: List[Dict], source: str, category: str, depth: int, source_collection: str = None) -> List[Prompt]:
         """Recursively extract prompts from child pages"""
         prompts = []
 
@@ -344,14 +398,14 @@ class PromptExtractor:
             child_page_id = block.get("id")
             print(f"  {'  ' * depth}[{i+1}/{len(child_pages)}] Processing child page...")
             # Recursively extract from child page
-            child_prompts = self.extract_from_page(child_page_id, category=category, recursive=True, depth=depth+1)
+            child_prompts = self.extract_from_page(child_page_id, category=category, recursive=True, depth=depth+1, source_collection=source_collection)
             prompts.extend(child_prompts)
             if child_prompts:
                 print(f"  {'  ' * depth}    -> Found {len(child_prompts)} prompts")
 
         return prompts
 
-    def _extract_from_databases(self, blocks: List[Dict], source: str, category: str, depth: int) -> List[Prompt]:
+    def _extract_from_databases(self, blocks: List[Dict], source: str, category: str, depth: int, source_collection: str = None) -> List[Prompt]:
         """Extract prompts from Notion databases"""
         prompts = []
 
@@ -362,13 +416,13 @@ class PromptExtractor:
         for i, block in enumerate(databases):
             database_id = block.get("id")
             print(f"  {'  ' * depth}[{i+1}/{len(databases)}] Querying database...")
-            db_prompts = self._extract_from_database(database_id, source, category, depth)
+            db_prompts = self._extract_from_database(database_id, source, category, depth, source_collection)
             prompts.extend(db_prompts)
             print(f"  {'  ' * depth}    -> Extracted {len(db_prompts)} prompts from database")
 
         return prompts
 
-    def _extract_from_database(self, database_id: str, source: str, category: str, depth: int) -> List[Prompt]:
+    def _extract_from_database(self, database_id: str, source: str, category: str, depth: int, source_collection: str = None) -> List[Prompt]:
         """Extract prompts from a specific database"""
         prompts = []
 
@@ -388,7 +442,7 @@ class PromptExtractor:
             # Also extract from the page content itself (but not recursively to save time)
             page_id = page.get("id")
             if page_id not in self.processed_pages:
-                page_prompts = self.extract_from_page(page_id, category=category, recursive=False, depth=depth+1)
+                page_prompts = self.extract_from_page(page_id, category=category, recursive=False, depth=depth+1, source_collection=source_collection)
                 prompts.extend(page_prompts)
 
         return prompts
@@ -550,7 +604,7 @@ class MigrationOrchestrator:
     def __init__(self, notion_token: str):
         self.notion = NotionClient(notion_token)
         self.supabase = SupabaseManager(SUPABASE_URL, SUPABASE_KEY)
-        self.extractor = PromptExtractor(self.notion)
+        self.extractor = PromptExtractor(self.notion, self.supabase)
         self.category_map = self.supabase.get_category_map()
     
     def migrate_ultimate_chatgpt_bible(self, root_page_id: str):
@@ -657,38 +711,42 @@ class MigrationOrchestrator:
         )
 
         try:
-            # Reset processed pages for this collection
+            # Reset processed pages and pending prompts for this collection
             self.extractor.processed_pages.clear()
+            self.extractor.pending_prompts.clear()
 
             # Extract prompts recursively (handles child pages and databases)
+            # Batch insertion happens automatically during extraction
             print(f"Scanning page structure and extracting prompts...")
-            print(f"(This may take several minutes depending on collection size)\n")
-            prompts = self.extractor.extract_from_page(root_page_id, recursive=True)
+            print(f"(Prompts are saved in batches of {self.extractor.batch_size} as we extract)\n")
+            prompts = self.extractor.extract_from_page(root_page_id, recursive=True, source_collection=collection_name)
+
+            # Flush any remaining prompts
+            final_batch = self.extractor.flush_pending_prompts(collection_name)
 
             print(f"\n{'='*60}")
             print(f"EXTRACTION COMPLETE: Found {len(prompts)} prompts")
             print(f"{'='*60}\n")
 
-            # Insert prompts with progress indicator
-            print(f"Inserting prompts into Supabase...")
-            inserted = 0
-            for idx, prompt in enumerate(prompts):
-                if idx % 50 == 0 and idx > 0:
-                    print(f"  Inserted {idx}/{len(prompts)} prompts...")
+            # All prompts were inserted during extraction via batching
+            # Just count total for reporting
+            total_extracted = len(prompts)
 
-                prompt.source = collection_name
-                if self.supabase.insert_prompt(prompt):
-                    inserted += 1
-
-            print(f"\nOK: Successfully inserted {inserted}/{len(prompts)} prompts")
+            print(f"\nOK: Migration completed")
+            print(f"Total prompts extracted and saved: {total_extracted}")
 
             # Log completion
-            self.supabase.log_migration_complete(log_id, len(prompts), inserted)
+            self.supabase.log_migration_complete(log_id, total_extracted, total_extracted)
 
         except Exception as e:
             print(f"\nERROR: {e}")
             import traceback
             traceback.print_exc()
+            # Try to flush any pending prompts before failing
+            try:
+                self.extractor.flush_pending_prompts(collection_name)
+            except:
+                pass
             self.supabase.log_migration_complete(log_id, 0, 0, str(e))
 
 # ================================================================
